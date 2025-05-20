@@ -143,19 +143,36 @@ function fqs_handle_tax_sync($req)
 		update_term_meta($term_id, 'as_description', $description);
 		update_term_meta($term_id, 'Description', $description);
 
-		/* ▸ Profile image (sideload) */
-		if (! empty($fields['profile_image_url'])) {
-			if (defined('ABSPATH')) {
+		// media
+
+		if ( ! empty( $fields['profile-image_link'] ) ) {
+			$image_url = esc_url_raw( $fields['profile-image_link'] );
+			$attachment_id = 0;
+
+			// 1) Try to find an existing attachment by URL
+			if ( function_exists( 'attachment_url_to_postid' ) ) {
+				$attachment_id = attachment_url_to_postid( $image_url );
+			}
+
+			// 2) If it’s not in the library, fall back to sideloading
+			if ( ! $attachment_id ) {
 				require_once ABSPATH . 'wp-admin/includes/file.php';
 				require_once ABSPATH . 'wp-admin/includes/media.php';
 				require_once ABSPATH . 'wp-admin/includes/image.php';
+
+				$maybe_id = media_sideload_image( $image_url, 0, null, 'id' );
+				if ( is_wp_error( $maybe_id ) ) {
+					error_log( '[QuickSync] media_sideload_image failed for ' 
+							. $image_url . ': ' 
+							. $maybe_id->get_error_message() );
+				} else {
+					$attachment_id = $maybe_id;
+				}
 			}
-			$image_id = media_sideload_image(esc_url_raw($fields['profile_image_url']), 0, null, 'id');
-			if (is_wp_error($image_id)) {
-				error_log($log_prefix . 'media_sideload_image failed: ' . $image_id->get_error_message());
-			} else {
-				update_term_meta($term_id, 'profile_image', $image_id);
-				error_log($log_prefix . "Updated profile image for term {$term_id}");
+
+			// 3) If we now have an attachment ID, save it to term meta
+			if ( $attachment_id ) {
+				update_term_meta( $term_id, 'profile-image', $attachment_id );
 			}
 		}
 

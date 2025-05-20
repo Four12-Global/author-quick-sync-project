@@ -2,80 +2,105 @@
  * Syncs author-speaker record data from Airtable to WordPress via Quick-Sync plugin.
  *
  * Trigger: Record "Publish" or status change on table "author-speaker".
- *
- * @param {Object} input - Airtable script input object.
- * @param {Object} input.config - Contains runtime variables (expects recordId).
- * @param {Function} input.secret - Function to retrieve secrets (expects 'API-SYNC').
- * @param {Object} base - Airtable base object for table access.
- * @param {Object} output - Airtable script output object.
  */
 
 try {
-  // 1️⃣  Pull the one runtime variable we need (recordId)
-  const { recordId } = input.config();
-
-  // 2️⃣  Get the Basic‑Auth header from Secrets
-  const API_CREDS = input.secret('API-SYNC'); // "api_sync:xxxx ..."
-  const BASIC = Buffer.from(API_CREDS).toString('base64');
-
-  // 3️⃣  Look up the record in the author‑speaker table
-  const table = base.getTable('author-speaker');
-  const record = await table.selectRecordAsync(recordId);
-
-  if (!record) {
-    throw new Error(`Record with ID ${recordId} not found.`);
-  }
-
-  // 4️⃣  Build the payload expected by the WP Quick‑Sync plugin
-  const fields = {};
-  const authorTitle = record.getCellValueAsString('author_title');
-  if (authorTitle) fields.author_title = authorTitle;
-  const authorDesc = record.getCellValueAsString('author_description_html');
-  if (authorDesc) fields.author_description = authorDesc;
-  const profileImage = record.getCellValue('profile_image_link')?.[0]?.url;
-  if (profileImage) fields.profile_image_url = profileImage;
-  const status = record.getCellValueAsString('status');
-  if (status) fields.status = status;
-
-  const payload = {
-    recordId: record.id,
-    sku: record.getCellValueAsString('sku'), // Add SKU as unique ID
-    fields,
-  };
-
-  console.log('QuickSync payload:', JSON.stringify(payload));
-
-  // 5️⃣  Fire the POST to WordPress
-  const res = await fetch('https://four12global.com/wp-json/four12/v1/tax-sync', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Basic ${BASIC}`,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  // 6️⃣  Expose the HTTP result in the run log
-  output.set('wpStatus', `${res.status} ${res.statusText}`);
-
-  let responseText = await res.text();
-  try {
-    const json = JSON.parse(responseText);
-    if (json.error) {
-      console.error('WordPress sync error:', json.error);
-      output.set('wpError', json.error);
+    // 1️⃣ Pull the recordId from your automation input
+    const { recordId } = input.config();
+  
+    // 2️⃣ Grab your Basic-Auth creds from Airtable Secrets
+    const API_CREDS = input.secret('API-SYNC'); // e.g. "Four12API:abcd efgh …"
+    const BASIC = Buffer.from(API_CREDS).toString('base64');
+  
+    // 3️⃣ Fetch the record
+    const table = base.getTable('author-speaker');
+    const record = await table.selectRecordAsync(recordId);
+    if (!record) throw new Error(`Record ${recordId} not found.`);
+  
+    // 4️⃣ Build only the fields WP expects
+    const syncFields = {};
+    const authorTitle = record.getCellValueAsString('author_title');
+    if (authorTitle) syncFields.author_title = authorTitle;
+  
+    const authorDesc = record.getCellValueAsString('author_description');
+    if (authorDesc) syncFields.author_description = authorDesc;
+  
+    // profile_image_link is a plain URL field
+    const profileImageLink = record.getCellValueAsString('profile_image_link');
+    if (profileImageLink) syncFields.profile_image_link = profileImageLink;
+  
+    const statusValue = record.getCellValueAsString('status');
+    if (statusValue) syncFields.status = statusValue;
+  
+    // 5️⃣ Assemble payload
+    const payload = {
+      recordId,
+      sku:    record.getCellValueAsString('sku'),
+      fields: syncFields,
+    };
+  
+    // // 🖨️ Pretty-print for debugging
+    // const pretty = JSON.stringify(payload, null, 2);
+    // console.log('📬 Payload:\n' + pretty);
+    // output.markdown(`\`\`\`json\n${pretty}\n\`\`\``);
+  
+    // 6️⃣ POST to WordPress
+    let res;
+    try {
+      res = await fetch('https://four12global.com/wp-json/four12/v1/tax-sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': `Basic ${BASIC}`,
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch (fetchErr) {
+      console.error('Fetch error:', fetchErr);
+      output.set('wpStatus', 'ERROR');
+      output.set('wpError', fetchErr.message);
+      return;
+    }
+  
+    // 7️⃣ Read and log raw response
+    const bodyText = await res.text();
+    console.log('Response body:', bodyText);
+  
+    // 8️⃣ Parse the JSON response
+    let data;
+    try {
+      data = JSON.parse(bodyText);
+    } catch {
+      // If it wasn’t valid JSON and WP returned an error status
+      if (!res.ok) {
+        output.set('wpError', bodyText);
+        console.error('Non-JSON error response:', bodyText);
+      }
+      return;
+    }
+  
+    // 9️⃣ Safely write the WP response into your run outputs
+    if (data.error) {
+      const errStr = typeof data.error === 'string'
+        ? data.error
+        : JSON.stringify(data.error);
+      output.set('wpError', errStr);
     } else {
-      output.set('wpResult', json);
+      output.set('wpResult', JSON.stringify(data));
     }
-  } catch (e) {
-    // Not JSON, just log
-    if (!res.ok) {
-      console.error(`WordPress sync failed: ${res.status} ${res.statusText} - ${responseText}`);
-      output.set('wpError', responseText);
+  
+    // 🔟 Safely set result or error
+    if (data.error) {
+      const errStr = typeof data.error === 'string'
+        ? data.error
+        : JSON.stringify(data.error);
+      output.set('wpError', errStr);
+    } else {
+      output.set('wpResult', JSON.stringify(data));
     }
+  
+  } catch (err) {
+    console.error('Sync script error:', err);
+    output.set('wpStatus', 'ERROR');
+    output.set('wpError', err.message || String(err));
   }
-} catch (err) {
-  console.error('Sync script error:', err);
-  output.set('wpStatus', 'ERROR');
-  output.set('wpError', err.message || String(err));
-}
