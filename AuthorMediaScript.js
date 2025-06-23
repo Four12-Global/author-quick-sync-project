@@ -15,7 +15,7 @@
  *   4. If any image actually changed, stamp `media_publish_timestamp` with NOW.
  *
  * Required Airtable fields on your **Authors** table:
- *   profile_image_attachment                (attachment)
+ *   profile_image                (attachment)
  *   profile_image_wp_id          (number)
  *   profile_image_link           (single‑line URL)
  *   profile_image_external       (single‑line URL – caches original URL)
@@ -30,7 +30,7 @@
 
 /** === CONFIGURATION === */
 const WP_MEDIA_ENDPOINT = "https://four12global.com/wp-json/wp/v2/media"; // change if staging
-const TABLE_NAME        = "Authors";                                      // Airtable table name
+const TABLE_NAME        = "author-speaker";                               // Airtable table name
 const API_SECRET_NAME   = "API-SYNC";                                    // secret key name
 
 // Image fields to process – easy to extend later
