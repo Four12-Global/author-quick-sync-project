@@ -1,116 +1,135 @@
 /**
- * Syncs author-speaker record data from Airtable to WordPress via Quick-Sync plugin.
+ * Author Quick Sync – Airtable Automation Script
  *
- * Trigger: Record "Publish" or status change on table "author-speaker".
+ * WHAT IT DOES
+ * 1. Runs inside an Airtable automation when the Admin clicks the ✨Sync Author✨ button.
+ * 2. Collects the record’s data, squashes it into a neat JSON payload, and fires it at the
+ *    WordPress Author‑Sync REST endpoint.
+ * 3. Logs the WordPress response back into the triggering record for visibility.
+ *
+ * Assumptions:
+ * – This script is attached to a "Run a script" action in an Airtable automation.
+ * – Input variables supplied by the automation are:
+ *     • recordId          – the Airtable Record ID to sync
+ *     • apiBaseUrl        – e.g. "https://four12global.com" (NO trailing slash)
+ *     • basicAuthHeader   – pre‑encoded "Basic base64(user:appPassword)"
+ *
+ * Tweak/extend as required but keep the overall contract identical to SeriesQuickSyncScript.js.
  */
 
-try {
-  // 1️⃣ Pull the recordId from your automation input
-  const { recordId } = input.config();
+/*******************************
+ * 0 · Helper Utilities        *
+ ******************************/
+const log = (...msg) => console.log('[AuthorQuickSync]', ...msg);
 
-  // 2️⃣ Grab your Basic-Auth creds from Airtable Secrets
-  const API_CREDS = input.secret('API-SYNC'); // e.g. "Four12API:abcd efgh …"
-  const BASIC = Buffer.from(API_CREDS).toString('base64');
-
-  // 3️⃣ Fetch the record
-  const table = base.getTable('author-speaker');
-  const record = await table.selectRecordAsync(recordId);
-  if (!record) throw new Error(`Record ${recordId} not found.`);
-
-  // 4️⃣ Build only the fields WP expects
-  const syncFields = {};
-  const authorTitle = record.getCellValueAsString('author_title');
-  if (authorTitle) syncFields.author_title = authorTitle;
-
-  const authorDesc = record.getCellValueAsString('author_description');
-  if (authorDesc) syncFields.author_description = authorDesc;
-
-  // profile_image_link is a plain URL field
-  const profileImageLink = record.getCellValueAsString('profile_image_link');
-  if (profileImageLink) syncFields.profile_image_link = profileImageLink;
-
-  const statusValue = record.getCellValueAsString('status');
-  if (statusValue) syncFields.status = statusValue;
-
-  console.log(
-'🔍 Raw Airtable value for profile_image_link:',
-record.getCellValue('profile_image_link'),
-record.getCellValueAsString('profile_image_link')
-);
-console.log(
-'🔍 Fields so far:',
-JSON.stringify(syncFields, null, 2)
-);
-
-  // 5️⃣ Assemble payload
-  const payload = {
-    recordId,
-    sku:    record.getCellValueAsString('sku'),
-    fields: syncFields,
+/**
+ * Fetch wrapper that logs request + response and throws on non‑2xx status codes.
+ */
+async function wpFetch(url, options = {}) {
+  const safeOpts = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+    ...options,
   };
 
-  // // 🖨️ Pretty-print for debugging
-  // const pretty = JSON.stringify(payload, null, 2);
-  // console.log('📬 Payload:\n' + pretty);
-  // output.markdown(`\`\`\`json\n${pretty}\n\`\`\``);
+  const start = Date.now();
+  const res   = await fetch(url, safeOpts);
+  const ms    = Date.now() - start;
+  const text  = await res.text();
 
-  // 6️⃣ POST to WordPress
-  let res;
-  try {
-    res = await fetch('https://four12global.com/wp-json/four12/v1/tax-sync', {
-      method: 'POST',
-      headers: {
-        'Content-Type':  'application/json',
-        'Authorization': `Basic ${BASIC}`,
-      },
-      body: JSON.stringify(payload),
-    });
-  } catch (fetchErr) {
-    console.error('Fetch error:', fetchErr);
-    output.set('wpStatus', 'ERROR');
-    output.set('wpError', fetchErr.message);
-    return;
-  }
+  log(`${safeOpts.method} → ${url} (${res.status}) in ${ms} ms`);
+  log('Response body (truncated 2 KB):', text.slice(0, 2048));
 
-  // 7️⃣ Read and log raw response
-  const bodyText = await res.text();
-  console.log('Response body:', bodyText);
-
-  // 8️⃣ Parse the JSON response
-  let data;
-  try {
-    data = JSON.parse(bodyText);
-  } catch {
-    // If it wasn’t valid JSON and WP returned an error status
-    if (!res.ok) {
-      output.set('wpError', bodyText);
-      console.error('Non-JSON error response:', bodyText);
-    }
-    return;
-  }
-
-  // 9️⃣ Safely write the WP response into your run outputs
-  if (data.error) {
-    const errStr = typeof data.error === 'string'
-      ? data.error
-      : JSON.stringify(data.error);
-    output.set('wpError', errStr);
-  } else {
-    output.set('wpResult', JSON.stringify(data));
-  }
-
-  // 🔟 Safely set result or error
-  if (data.error) {
-    const errStr = typeof data.error === 'string'
-      ? data.error
-      : JSON.stringify(data.error);
-    output.set('wpError', errStr);
-  } else {
-    output.set('wpResult', JSON.stringify(data));
-  }
-
-} catch (err) {
-  console.error('Sync script error:', err);
-  output.set('wpStatus', 'ERROR');
-  output.set('wpError', err.message || String(err));
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return JSON.parse(text);
 }
+
+/*******************************
+ * 1 · Pull Automation Inputs  *
+ ******************************/
+// prettier‑ignore
+const {
+  recordId,
+  apiBaseUrl,
+  basicAuthHeader,
+} = input.config();
+
+if (!recordId) throw new Error('Missing input.recordId');
+if (!apiBaseUrl) throw new Error('Missing input.apiBaseUrl');
+if (!basicAuthHeader) throw new Error('Missing input.basicAuthHeader');
+
+/*******************************
+ * 2 · Grab the Record         *
+ ******************************/
+const table = base.getTable('Author / Speaker'); // adjust if your table name differs
+const record = await table.selectRecordAsync(recordId);
+if (!record) throw new Error(`Record not found: ${recordId}`);
+
+/*******************************
+ * 3 · Build Payload           *
+ ******************************/
+function val(field) {
+  return record.getCellValue(field);
+}
+
+function firstAttachmentId(field) {
+  const attachmentArr = val(field);
+  return Array.isArray(attachmentArr) && attachmentArr.length > 0
+    ? attachmentArr[0].id // Airtable attachment ID string
+    : null;
+}
+
+// Derive or fallback values
+const authorSlug = val('author_slug') ||
+  (val('author_title') || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+
+const payload = {
+  airtableRecordId: record.id,
+  sku:              val('sku'),
+  fields: {
+    name:            val('author_title'),
+    slug:            authorSlug,
+    description:     val('author_description') || '',
+    as_description:  val('as_description') || '',
+    news_description: val('news_description') || '',
+    profile_image:   val('profile_image_wp_id') || null,
+    sku:             val('sku'),
+  },
+};
+
+log('Outgoing payload →', JSON.stringify(payload, null, 2));
+
+/*******************************
+ * 4 · Fire at WordPress       *
+ ******************************/
+const endpoint = `${apiBaseUrl.replace(/\/$/, '')}/wp-json/four12/v1/author-sync`;
+
+let wpResponse;
+try {
+  wpResponse = await wpFetch(endpoint, {
+    body: JSON.stringify(payload),
+    headers: { Authorization: basicAuthHeader },
+  });
+  log('Sync SUCCESS →', wpResponse);
+} catch (err) {
+  log('Sync FAILED →', `${err.message}`);
+  await table.updateRecordAsync(record, {
+    Sync_Status: '❌ Failed',
+    Sync_Response: `${err.message}`.slice(0, 10000),
+  });
+  throw err; // Let Airtable mark the run failed for visibility
+}
+
+/*******************************
+ * 5 · Persist WP Response     *
+ ******************************/
+await table.updateRecordAsync(record, {
+  Sync_Status:   '✅ Synced',
+  Sync_Response: JSON.stringify(wpResponse).slice(0, 10000),
+  term_id:       wpResponse?.data?.term_id || null,
+});
+
+log('Author Quick Sync complete ✅');

@@ -1,194 +1,212 @@
 <?php
-// WordPress plugin: Four12 – Quick Sync
-//
-// Purpose:
-// - Receives REST requests from Airtable to sync author-speaker taxonomy terms.
-// - Uses 'author_description' (HTML) from Airtable as the term description.
-//
-// Steps:
-// 1. Registers the REST endpoint (handled by JetEngine for taxonomy registration).
-// 2. Handles POST requests to /four12/v1/tax-sync.
-// 3. Finds or creates/updates the taxonomy term by SKU meta.
-// 4. Updates the term description and meta fields.
-// 5. Optionally sideloads a profile image.
-// 6. Returns a detailed response for logging and debugging.
-//
-// Note: Taxonomy registration is handled by JetEngine, not this plugin.
-
 /**
- * Plugin Name: Four12 – Quick Sync
- * Description: Instantly syncs "Author aker" records from Airtable into the <code>author_speaker</code> taxonomy through an authenticated REST endpoint.
+ * Plugin Name: Author Quick Sync Project
+ * Description: REST endpoint to receive Author/Speaker data from Airtable and create/update `author_speaker` taxonomy terms including JetEngine meta.
  * Author: Four12 Global
- * Version: 1.0.1
+ * Version: 2.1.0
  */
 
-defined('ABSPATH') || exit;
+defined( 'ABSPATH' ) || exit;
+require_once __DIR__ . '/vendor/Parsedown.php';
 
-// ─────────────────────────────────────────────────────────
-//   1.  TAXONOMY REGISTRATION  (slug: author_speaker)
-//   NOTE: Registration removed. Handled by JetEngine.
-// ─────────────────────────────────────────────────────────
+class F12_Author_Quick_Sync {
 
-// ─────────────────────────────────────────────────────────
-//   2.  REST ENDPOINT            /four12/v1/tax-sync
-// ─────────────────────────────────────────────────────────
-add_action('rest_api_init', function () {
+	const ROUTE_NAMESPACE = 'four12/v1';
+	const ROUTE           = '/author-sync';
+	const TAXONOMY        = 'author_speaker';
+	const SKU_META_KEY    = 'sku';
+	const DEBUG           = false; // set to false in production
 
-	register_rest_route('four12/v1', '/tax-sync', [
-		'methods'             => 'POST',
-		'callback'            => 'fqs_handle_tax_sync',
-		'permission_callback' => function () {
-			// Application‑Password user (api_sync) must be authenticated
-			// and have capability to edit terms/posts.
-			return current_user_can('edit_posts');
-		},
-	]);
-});
+	/**
+	 * Bootstraps class.
+	 */
+	public static function init() {
+		add_action( 'rest_api_init', [ __CLASS__, 'register_route' ] );
+	}
 
-// -------------------------------------------------------------------------
-//   3.  ENDPOINT HANDLER
-// -------------------------------------------------------------------------
-/**
- * Handles syncing of Author/Speaker taxonomy via REST.
- *
- * @param WP_REST_Request $req The REST request object.
- * @return WP_REST_Response The REST response object.
- */
-function fqs_handle_tax_sync($req)
-{
-	$log_prefix = '[QuickSync] ' . date('Y-m-d H:i:s') . ' ';
-	try {
-		// Ensure WordPress is loaded
-		if (! function_exists('sanitize_text_field')) {
-			require_once dirname(__FILE__, 4) . '/wp-load.php';
-		}
-		if (! function_exists('sanitize_text_field')) {
-			error_log($log_prefix . 'WordPress functions unavailable.');
-			return null;
-		}
-		$body   = $req->get_json_params();
-		$sku    = sanitize_text_field($body['sku'] ?? '');
-		$fields = $body['fields'] ?? [];
-		$user   = function_exists('wp_get_current_user') ? wp_get_current_user() : null;
-		$user_info = $user && is_object($user) && method_exists($user, 'exists') && $user->exists() ? $user->user_login : 'unknown';
+	/**
+	 * Registers the REST route.
+	 */
+	public static function register_route() {
+		register_rest_route(
+			self::ROUTE_NAMESPACE,
+			self::ROUTE,
+			[
+				'methods'             => WP_REST_Server::CREATABLE,
+				'callback'            => [ __CLASS__, 'handle_request' ],
+				'permission_callback' => function () {
+					return current_user_can( 'edit_posts' ); // Application‑password user needs this cap
+				},
+			]
+		);
+	}
 
-		// Log incoming request
-		error_log($log_prefix . "Request by {$user_info}: " . json_encode($body));
-		error_log($log_prefix . "Fields received: " . json_encode($fields));
+	/**
+	 * Handles the incoming POST from Airtable.
+	 */
+	public static function handle_request( WP_REST_Request $request ) {
+		$raw   = $request->get_body();
+		$data  = json_decode( $raw, true );
 
-		// Validate required parameters
-		if (! $sku || ! isset($fields['author_title'])) {
-			error_log($log_prefix . 'Bad payload. SKU or author_title missing.');
-			return class_exists('WP_REST_Response') ? new WP_REST_Response(['error' => 'Bad payload: SKU or author_title missing.'], 400) : null;
+		if ( json_last_error() !== JSON_ERROR_NONE ) {
+			return self::error( 'invalid_json', 'Request body must be valid JSON.' );
 		}
 
-		/* ▸ Locate existing term by sku meta */
-		$existing = get_terms([
-			'taxonomy'   => 'author_speaker',
-			'hide_empty' => false,
-			'meta_query' => [
-				[
-					'key'   => 'sku',
-					'value' => $sku,
+		$sku    = sanitize_text_field( $data['sku'] ?? '' );
+		$fields = $data['fields'] ?? [];
+
+		if ( empty( $sku ) ) {
+			return self::error( 'missing_sku', 'SKU is required.' );
+		}
+
+		$markdown_keys = [ 'author_description', 'as_description', 'news_description' ];
+		foreach ( $fields as $key => &$val ) {
+			if ( in_array( $key, $markdown_keys, true ) && is_string( $val ) ) {
+				$val = self::md_to_safe_html( $val );
+			}
+		}
+		unset( $val ); // break the reference
+
+		$name        = sanitize_text_field( $fields['name'] ?? '' );
+		$slug        = sanitize_title( $fields['slug'] ?? $name );
+		$description = $fields['author_description'] ?? '';
+
+		if ( empty( $name ) ) {
+			return self::error( 'missing_name', 'Author/Speaker name is required.' );
+		}
+
+		$existing_term_id = self::get_term_id_by_sku( $sku );
+
+		// Fallback to slug lookup if no SKU match.
+		if ( ! $existing_term_id ) {
+			$term = get_term_by( 'slug', $slug, self::TAXONOMY );
+			$existing_term_id = $term ? (int) $term->term_id : 0;
+		}
+
+		$action        = $existing_term_id ? 'updated' : 'created';
+		$changed_core  = [];
+		$changed_meta  = [];
+
+		$args = [
+			'name'        => $name,
+			'slug'        => $slug,
+			'description' => $description,
+		];
+
+		if ( $existing_term_id ) {
+			$old = get_term( $existing_term_id, self::TAXONOMY );
+			if ( $old ) {
+				if ( $old->name !== $name ) {
+					$changed_core[] = 'name';
+				}
+				if ( $old->description !== $description ) {
+					$changed_core[] = 'description';
+				}
+			}
+
+			$result = wp_update_term( $existing_term_id, self::TAXONOMY, $args );
+			if ( is_wp_error( $result ) ) {
+				return self::error( 'term_update_failed', $result->get_error_message() );
+			}
+			$term_id = (int) $result['term_id'];
+		} else {
+			$result = wp_insert_term( $name, self::TAXONOMY, $args );
+			if ( is_wp_error( $result ) ) {
+				return self::error( 'term_insert_failed', $result->get_error_message() );
+			}
+			$term_id      = (int) $result['term_id'];
+			$changed_core = [ 'name', 'description', 'slug' ];
+		}
+
+		// Always store/update SKU term‑meta.
+		if ( update_term_meta( $term_id, self::SKU_META_KEY, $sku ) ) {
+			$changed_meta[] = self::SKU_META_KEY;
+		}
+
+		// Whitelisted meta fields that map 1‑to‑1.
+		$meta_whitelist = [
+			'profile_image',
+			'as_description',
+			'news_description',
+			'status',
+		];
+
+		foreach ( $fields as $key => &$val ) {
+			if ( in_array( $key, $meta_whitelist, true ) ) {
+				$prev = get_term_meta( $term_id, $key, true );
+				if ( $prev !== $val ) {
+					update_term_meta( $term_id, $key, $val );
+					$changed_meta[] = $key;
+				}
+			}
+		}
+		unset( $val ); // break the reference
+
+		$response = [
+			'success' => true,
+			'data'    => [
+				'term_id'        => $term_id,
+				'term_url'       => get_term_link( $term_id ),
+				'action'         => $action,
+				'changed_fields' => [
+					'core' => $changed_core,
+					'meta' => $changed_meta,
 				],
 			],
-		]);
-		if (is_wp_error($existing)) {
-			error_log($log_prefix . 'get_terms failed: ' . $existing->get_error_message());
-			return class_exists('WP_REST_Response') ? new WP_REST_Response(['error' => 'get_terms failed: ' . $existing->get_error_message()], 500) : null;
-		}
-		$term_id = $existing[0]->term_id ?? 0;
-
-		/* ▸ Build args */
-		$args = [
-			'description' => wp_kses_post($fields['author_description'] ?? ''),
-			'slug'        => sanitize_title($fields['author_title']),
-			'meta_input'  => ['sku' => $sku],
 		];
-		error_log($log_prefix . "Args for insert/update: " . json_encode($args));
 
-		/* ▸ Insert or update */
-		if (! $term_id) {
-			$insert = wp_insert_term(wp_unslash($fields['author_title']), 'author_speaker', $args);
-			if (is_wp_error($insert)) {
-				// If the term exists by slug, find its ID and continue
-				if ($insert->get_error_code() === 'term_exists') {
-					$exists = term_exists(sanitize_title($fields['author_title']), 'author_speaker');
-					$term_id = is_array($exists) ? $exists['term_id'] : $exists;
-					if (! $term_id) {
-						error_log($log_prefix . 'term_exists but could not resolve term_id for slug: ' . sanitize_title($fields['author_title']));
-						return class_exists('WP_REST_Response') ? new WP_REST_Response(['error' => 'Could not resolve existing term_id for slug.'], 500) : null;
-					}
-				} else {
-					error_log($log_prefix . 'wp_insert_term failed: ' . $insert->get_error_message());
-					return class_exists('WP_REST_Response') ? new WP_REST_Response(['error' => 'wp_insert_term failed: ' . $insert->get_error_message()], 500) : null;
-				}
-			} else {
-				$term_id = $insert['term_id'];
-				error_log($log_prefix . "Inserted new term {$term_id} for SKU {$sku}");
-			}
-		} else {
-			$args['name'] = wp_unslash($fields['author_title']);
-			$update       = wp_update_term($term_id, 'author_speaker', $args);
-			if (is_wp_error($update)) {
-				error_log($log_prefix . 'wp_update_term failed: ' . $update->get_error_message());
-				return class_exists('WP_REST_Response') ? new WP_REST_Response(['error' => 'wp_update_term failed: ' . $update->get_error_message()], 500) : null;
-			}
-			error_log($log_prefix . "Updated term {$term_id} for SKU {$sku}");
+		return rest_ensure_response( $response );
+	}
+
+	/**
+	 * Looks up a term by SKU meta.
+	 */
+	protected static function get_term_id_by_sku( string $sku ): int {
+		$terms = get_terms( [
+			'taxonomy'   => self::TAXONOMY,
+			'hide_empty' => false,
+			'fields'     => 'ids',
+			'number'     => 1,
+			'meta_query' => [
+				[
+					'key'   => self::SKU_META_KEY,
+					'value' => $sku,
+					'compare' => '=',
+				],
+			],
+		] );
+
+		return ! empty( $terms ) ? (int) $terms[0] : 0;
+	}
+
+	/**
+	 * Convert Markdown to safe HTML.
+	 *
+	 * @param string $text Raw Markdown (or HTML).
+	 * @return string Sanitised HTML ready for output.
+	 */
+	protected static function md_to_safe_html( string $text ): string {
+		$alreadyHtml = $text !== strip_tags( $text );
+
+		if ( ! $alreadyHtml ) {
+			$pd = new Parsedown();
+			$pd->setSafeMode( true );          // strips naughty JS attributes
+			$text = $pd->text( $text );
 		}
 
-		/* ▸ Save description as meta fields */
-		$description = wp_kses_post($fields['author_description'] ?? '');
-		error_log($log_prefix . "Saving description/meta: " . $description);
-		update_term_meta($term_id, 'as_description', $description);
-		update_term_meta($term_id, 'Description', $description);
+		// Final belt-and-braces scrub
+		return wp_kses_post( $text );
+	}
 
-		// media
-
-		if ( ! empty( $fields['profile_image_link'] ) ) {
-			$image_url = esc_url_raw( $fields['profile_image_link'] );
-			$attachment_id = 0;
-
-			// 1) Try to find an existing attachment by URL
-			if ( function_exists( 'attachment_url_to_postid' ) ) {
-				$attachment_id = attachment_url_to_postid( $image_url );
-			}
-
-			// 2) If it’s not in the library, fall back to sideloading
-			if ( ! $attachment_id ) {
-				require_once ABSPATH . 'wp-admin/includes/file.php';
-				require_once ABSPATH . 'wp-admin/includes/media.php';
-				require_once ABSPATH . 'wp-admin/includes/image.php';
-
-				$maybe_id = media_sideload_image( $image_url, 0, null, 'id' );
-				if ( is_wp_error( $maybe_id ) ) {
-					error_log( '[QuickSync] media_sideload_image failed for ' 
-							. $image_url . ': ' 
-							. $maybe_id->get_error_message() );
-				} else {
-					$attachment_id = $maybe_id;
-				}
-			}
-
-			// 3) If we now have an attachment ID, save it to term meta
-			if ( $attachment_id ) {
-				update_term_meta( $term_id, 'profile_image', $attachment_id );
-			}
+	/**
+	 * Uniform error wrapper.
+	 */
+	protected static function error( string $code, string $message ) {
+		if ( self::DEBUG ) {
+			error_log( "[AuthorQuickSync] $code: $message" );
 		}
-
-		// Return more details in the response
-		$term = get_term($term_id, 'author_speaker');
-		$meta = get_term_meta($term_id);
-		$response = [
-			'term_id' => $term_id,
-			'status' => 'synced',
-			'term' => $term,
-			'meta' => $meta,
-		];
-		error_log($log_prefix . "Sync success for SKU {$sku}: " . json_encode($response));
-		return function_exists('rest_ensure_response') ? rest_ensure_response($response) : $response;
-	} catch (Throwable $e) {
-		error_log($log_prefix . 'UNCAUGHT ERROR: ' . $e->getMessage());
-		return class_exists('WP_REST_Response') ? new WP_REST_Response(['error' => 'Internal server error', 'details' => $e->getMessage()], 500) : null;
+		return new WP_Error( $code, $message, [ 'status' => 400 ] );
 	}
 }
+
+add_action( 'plugins_loaded', [ 'F12_Author_Quick_Sync', 'init' ] );
