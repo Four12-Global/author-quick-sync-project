@@ -145,8 +145,8 @@ function fqs_handle_tax_sync($req)
 
 		// media
 
-		if ( ! empty( $fields['profile-image_link'] ) ) {
-			$image_url = esc_url_raw( $fields['profile-image_link'] );
+		if ( ! empty( $fields['profile_image_link'] ) ) {
+			$image_url = esc_url_raw( $fields['profile_image_link'] );
 			$attachment_id = 0;
 
 			// 1) Try to find an existing attachment by URL
@@ -172,7 +172,7 @@ function fqs_handle_tax_sync($req)
 
 			// 3) If we now have an attachment ID, save it to term meta
 			if ( $attachment_id ) {
-				update_term_meta( $term_id, 'profile-image', $attachment_id );
+				update_term_meta( $term_id, 'profile_image', $attachment_id );
 			}
 		}
 
